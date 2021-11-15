@@ -1,0 +1,252 @@
+pipeline {
+    agent none
+    options{
+        buildDiscarder(logRotator(daysToKeepStr: '5',numToKeepStr: '3'))
+    }
+    
+    parameters {
+      booleanParam defaultValue: false, description: 'Enable Clean Build', name: 'CLEAN'
+
+    }
+
+    stages {
+        stage('Checkout Scm') {
+            agent {
+                label 'build'
+            }
+            steps {
+                git branch: 'master', credentialsId: 'gitCred', url: 'https://dev.azure.com/mohanramc634/DEVOPS/_git/jenkins'
+            }
+        }
+        
+        stage('PreCheck') {
+            agent {
+                label 'build'
+            }
+            
+            steps {
+                script {
+                    env.BUILDME = "yes"
+                }
+            }
+        }
+        
+        stage('Build') {
+            tools {
+                jdk 'JDK1_8'
+            }
+            agent {
+                label 'build'
+            }
+            when {
+                environment name: 'BUILDME', value: 'yes'
+            }
+            steps {
+                script {
+                    if (params.CLEAN){
+                        cleanstr = "clean"
+                    }
+                    else {
+                        cleanstr = ""
+                    }
+                    echo "Building JAR Component"
+                    dir("./samplejar") {
+                        bat "mvn ${cleanstr} package"
+                    }
+                    echo "Building WAR Component"
+                    dir("./samplewar") {
+                        bat "mvn ${cleanstr} package"
+                    }
+                    
+                }
+            }
+            
+        }
+        
+        stage('Code Coverage') {
+            agent {
+                label 'build'
+            }
+            when {
+                environment name: 'BUILDME', value: 'yes'
+            }
+            steps {
+                echo "Running Code Coverage"
+                dir("./samplejar") {
+                    bat "mvn org.jacoco:jacoco-maven-plugin:0.5.5.201112152213:prepare-agent"
+                }
+            }
+            
+        }
+        stage('Sonar Analysis'){
+            agent {
+                label 'build'
+            }
+            when {
+                environment name: 'BUILDME', value:'yes'
+            }
+            steps{
+                withSonarQubeEnv('SonarQube'){
+                    dir("./samplejar"){
+                        bat "mvn sonar:sonar"
+                    }
+                }
+            }
+            
+        }
+        stage('Quality Gates'){
+            when{
+               environment name: 'BUILDME', value:'yes' 
+            }
+            steps{
+                script {
+                    timeout(time: 10, unit: 'MINUTES') {
+                        def qg = waitForQualityGate()
+                        if (qg.status != 'OK'){
+                            error "Pipeline aborted due to quality gate failure : ${qg.status}"
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Stage Artifacts'){
+            agent { 
+                label 'build'
+            }
+            when {
+                environment name: 'BUILDME', value: 'yes'
+                
+            }
+            steps {
+                script {
+                    rtUpload (
+                        serverId: 'jfrog',
+                        spec: '''{
+                        "files": [
+                        {
+                        "pattern": "samplewar/target/samplewar.war",
+                        "target": "maven-bat"
+                        }
+                        ]
+                        }''',
+                        
+                        )
+                    
+                }
+            }
+            
+        }
+        
+        stage ('Publish build info') {
+            agent {
+                label 'build'
+            }
+            steps {
+                rtPublishBuildInfo (
+                    serverId: 'jfrog'
+                )
+            }
+        }
+        
+        stage ('Deploy War To BAT If User Confirm') {
+            
+            agent {
+                label 'bat'
+            }
+
+            steps {
+                script {
+                    rtDownload (
+                        serverId: 'jfrog',
+                        spec: '''{
+                        "files": [
+                        {
+                        "pattern": "maven-bat/samplewar.war",
+                        "target": "C:\\Program Files\\Apache Software Foundation\\Tomcat 9.0\\webapps\\"
+                        }
+                        ]
+                        }''',
+                        
+                        )
+                }
+                
+            }
+        }
+        
+        stage('Smoke Test') {
+            agent {
+                label 'build'
+            }
+            steps {
+                bat "curl --retry-delay 10 --retry 5 http://jfrog-tomcat-dev.eastus.cloudapp.azure.com:9080/samplewar/"
+            }
+        }
+        
+        stage('UAT approval and deployment') {
+            agent none
+            steps {
+                timeout(time: 10, unit: 'MINUTES') {
+                    mail to: 'mohanram634@outlook.com',
+                    subject: "[Approval] for ${currentBuild.fullDisplayName}",
+                    body: '''<a href="${BUILD_URL}input">click to approve</a>'''
+                    input message: 'Approve deployment?'
+                }
+                    
+                    
+                    
+            }
+        }
+        
+        stage ('Deploy to UAT server') {
+            agent {
+                label 'uat'
+            }
+
+            steps {
+                script {
+                    rtDownload (
+                        serverId: 'jfrog',
+                        spec: '''{
+                        "files": [
+                        {
+                        "pattern": "maven-bat/samplewar.war",
+                        "target": "C:\\Program Files\\Apache Software Foundation\\Tomcat 9.0\\webapps\\"
+                        }
+                        ]
+                        }''',
+                        
+                        )
+                }
+                
+            }
+        }
+        
+        stage('UAT Test') {
+            
+            agent {
+                label 'build'
+            }
+            steps {
+                bat "curl --retry-delay 10 --retry 5 http://jenkins634.eastus.cloudapp.azure.com:9080/samplewar/"
+            }
+        }
+        
+        
+        
+        
+    
+    }
+    
+    post {
+        always {
+            mail to: 'mohanram634@outlook.com',
+            subject: "Status of pipeline: ${currentBuild.fullDisplayName}",
+            body: "${env.BUILD_URL} has result ${currentBuild.result}"
+        }
+        
+    }
+    
+    
+
+}
